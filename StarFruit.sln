@@ -7,6 +7,11 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "StarFruit", "StarFruit\Star
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RatingAPIFunc", "RatingAPIFunc\RatingAPIFunc.csproj", "{C630C2AD-26CC-425C-B913-87CCC11A3CBF}"
 EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Solution Items", "Solution Items", "{329F7BB5-496A-4CF6-B635-88E83F73A0D1}"
+	ProjectSection(SolutionItems) = preProject
+		.deployment = .deployment
+	EndProjectSection
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
