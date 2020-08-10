@@ -13,6 +13,7 @@ namespace RatingAPIFunc
 {
     public static class RatingAPIFuncApp
     {
+        // Comments
         [FunctionName("CreateRating")]
         public static async Task<IActionResult> Run(
             [HttpTrigger(AuthorizationLevel.Function, "post", Route = null)] HttpRequest req,
