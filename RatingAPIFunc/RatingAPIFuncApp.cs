@@ -11,6 +11,11 @@ using System.Net.Http;
 using Microsoft.Azure.WebJobs.Host;
 using System.Collections.Generic;
 using System.Linq;
+using Azure.Storage.Blobs;
+using Azure.Storage.Blobs.Models;
+using Microsoft.Extensions.Configuration;
+using Newtonsoft.Json.Linq;
+using Microsoft.Azure.Documents;
 
 namespace RatingAPIFunc
 {
@@ -83,6 +88,89 @@ namespace RatingAPIFunc
             return new NotFoundObjectResult("No ratings found for userId:" + userId);
         }
 
+        [FunctionName("ProcessBtachFiles")]
+        public static async Task<IActionResult> ProcessBatchFiles(
+            [HttpTrigger(AuthorizationLevel.Function, "post", Route = null)] HttpRequest req,
+            [CosmosDB(
+            databaseName: "ratings",
+            collectionName: "orders",
+            ConnectionStringSetting = "RatingsDBConnection")]IAsyncCollector<Document> orders,
+            ILogger log, ExecutionContext context)
+        {
+            var config = new ConfigurationBuilder()
+                .SetBasePath(context.FunctionAppDirectory)
+                .AddJsonFile("local.settings.json", optional: true, reloadOnChange: true)
+                .AddEnvironmentVariables()
+                .Build();
+            // Create a BlobServiceClient object which will be used to create a container client
+            BlobServiceClient blobServiceClient = new BlobServiceClient(config["BatchStorageAccount"]);
+
+            // Create the container and return a container client object
+            BlobContainerClient containerClient = blobServiceClient.GetBlobContainerClient("datafiles");
+
+            List<string> uniquePrefixes = new List<string>();
+            foreach (BlobItem blobItem in containerClient.GetBlobs())
+            {
+                string prefix = blobItem.Name.Substring(0, blobItem.Name.IndexOf("-"));
+                if (!uniquePrefixes.Contains(prefix))
+                {
+                    uniquePrefixes.Add(prefix);
+                }                
+            }
+
+            foreach (string prefix in uniquePrefixes)
+            {
+                var blobs = containerClient.GetBlobs(BlobTraits.None, BlobStates.None, prefix);
+                if (blobs.Count() == 3)
+                {
+                    string result = await CobmineFiles(prefix);
+                    JArray orderArray = JArray.Parse(result);
+                    foreach(JObject order in orderArray)
+                    {
+                        string json = JsonConvert.SerializeObject(order);
+                        using (JsonTextReader reader = new JsonTextReader(new StringReader(json)))
+                        {
+                            var document = new Document();
+                            document.LoadFrom(reader);
+                            await orders.AddAsync(document);
+                        }
+                    }
+
+                    // Delete blobs
+                    foreach(var blob in blobs)
+                    {
+                        containerClient.DeleteBlob(blob.Name);
+                    }
+
+                    Console.WriteLine("Processed prefix:" + prefix);
+                }
+            }
+
+            return new OkObjectResult(uniquePrefixes.Count());
+        }
+
+        private static async Task<string> CobmineFiles(string prefix)
+        {
+            string jsonData = @"{
+                                  'orderHeaderDetailsCSVUrl': 'https://nzserverlessohbatchdata.blob.core.windows.net/datafiles/XXXXXXXXXXXXXX-OrderHeaderDetails.csv',
+                                  'orderLineItemsCSVUrl': 'https://nzserverlessohbatchdata.blob.core.windows.net/datafiles/XXXXXXXXXXXXXX-OrderLineItems.csv',
+                                  'productInformationCSVUrl': 'https://nzserverlessohbatchdata.blob.core.windows.net/datafiles/XXXXXXXXXXXXXX-ProductInformation.csv'
+                                }";
+            jsonData = jsonData.Replace("XXXXXXXXXXXXXX", prefix);
+            jsonData = jsonData.Replace("'", "\"");
+            var content = new StringContent(jsonData,
+                                          System.Text.Encoding.UTF8,
+                                          "application/json"
+                                          );
+            HttpClient newClient = new HttpClient();
+            HttpResponseMessage response = await newClient.PostAsync("https://serverlessohmanagementapi.trafficmanager.net/api/order/combineOrderContent", content);
+            string responseData = await response.Content.ReadAsStringAsync();
+
+            JArray orders = JArray.Parse(responseData);
+            
+            return responseData;
+        }
+
         private static async Task<bool> IsUserIdValidAsync(string userId)
         {
             HttpClient newClient = new HttpClient();
@@ -122,4 +210,28 @@ namespace RatingAPIFunc
         public int rating { get; set; }
         public string userNotes { get; set; }
     }
+
+    public class OrderHeaderDetails
+    {
+        public string ponumber { get; set; }
+        public string datetime { get; set; }
+        public string locationid { get; set; }
+        public string locationname { get; set; }
+        public string locationaddress { get; set; }
+        public string locationpostcode { get; set; }
+        public string totalcost { get; set; }
+        public string totaltax { get; set; }
+    }
+
+    public class OrderLineItem
+    {
+        public string ponumber { get; set; }
+        public string productid { get; set; }
+        public string quantity { get; set; }
+        public string unitcost { get; set; }
+        public string totalcost { get; set; }
+        public string totaltax { get; set; }
+    }
+
+    //public class 
 }
