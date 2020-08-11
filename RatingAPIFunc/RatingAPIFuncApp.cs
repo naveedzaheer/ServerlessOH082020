@@ -16,6 +16,8 @@ using Azure.Storage.Blobs.Models;
 using Microsoft.Extensions.Configuration;
 using Newtonsoft.Json.Linq;
 using Microsoft.Azure.Documents;
+using Microsoft.Azure.EventHubs;
+using System.Text;
 
 namespace RatingAPIFunc
 {
@@ -147,6 +149,41 @@ namespace RatingAPIFunc
             }
 
             return new OkObjectResult(uniquePrefixes.Count());
+        }
+
+        [FunctionName("ProcessPOSEvents")]
+        public static async Task ProcessPOSEvents(
+            [EventHubTrigger("samples-workitems", Connection = "EventHubConnectionAppSetting")] EventData[] eventHubMessages,
+            [CosmosDB(
+            databaseName: "ratings",
+            collectionName: "posEvents",
+            ConnectionStringSetting = "RatingsDBConnection")]IAsyncCollector<Document> posEvents, 
+            ILogger log)
+        {
+            foreach (var message in eventHubMessages)
+            {
+                try
+                {
+                    string json = JsonConvert.SerializeObject(Encoding.UTF8.GetString(message.Body));
+                    json = json.Replace("\\", "");
+                    json = json.Substring(1, json.Length - 2);
+                    JObject jObject = JObject.Parse(json);
+                    json = JsonConvert.SerializeObject(jObject);
+                    using (JsonTextReader reader = new JsonTextReader(new StringReader(json)))
+                    {
+                        var document = new Document();
+                        document.LoadFrom(reader);
+                        await posEvents.AddAsync(document);
+                    }
+                    log.LogInformation($"C# function triggered to process a message: {Encoding.UTF8.GetString(message.Body)}");
+                    log.LogInformation($"EnqueuedTimeUtc={message.SystemProperties.EnqueuedTimeUtc}");
+                }
+                catch (Exception ex)
+                {
+                    log.LogInformation($"C# function triggered to process a message : {Encoding.UTF8.GetString(message.Body)} with error: {ex.Message}");
+                    log.LogInformation($"EnqueuedTimeUtc={message.SystemProperties.EnqueuedTimeUtc}");
+                }
+            }
         }
 
         private static async Task<string> CobmineFiles(string prefix)
