@@ -18,6 +18,10 @@ using Newtonsoft.Json.Linq;
 using Microsoft.Azure.Documents;
 using Microsoft.Azure.EventHubs;
 using System.Text;
+using Microsoft.Azure.WebJobs.ServiceBus;
+using Microsoft.Azure.ServiceBus;
+using System.Net;
+using Microsoft.Azure.Storage.Blob;
 
 namespace RatingAPIFunc
 {
@@ -150,14 +154,15 @@ namespace RatingAPIFunc
 
             return new OkObjectResult(uniquePrefixes.Count());
         }
-
+        
         [FunctionName("ProcessPOSEvents")]
         public static async Task ProcessPOSEvents(
             [EventHubTrigger("samples-workitems", Connection = "EventHubConnectionAppSetting")] EventData[] eventHubMessages,
             [CosmosDB(
             databaseName: "ratings",
             collectionName: "posEvents",
-            ConnectionStringSetting = "RatingsDBConnection")]IAsyncCollector<Document> posEvents, 
+            ConnectionStringSetting = "RatingsDBConnection")]IAsyncCollector<Document> posEvents,
+            [ServiceBus("receipts", EntityType.Topic, Connection = "ServiceBusConnection")] IAsyncCollector<Message> messages,
             ILogger log)
         {
             foreach (var message in eventHubMessages)
@@ -175,6 +180,12 @@ namespace RatingAPIFunc
                         document.LoadFrom(reader);
                         await posEvents.AddAsync(document);
                     }
+
+                    if (jObject["header"]["receiptUrl"].ToString().Length > 0)
+                    {
+                        await messages.AddAsync(await BuildQueueMessage(jObject, log));
+                    }
+
                     log.LogInformation($"C# function triggered to process a message: {Encoding.UTF8.GetString(message.Body)}");
                     log.LogInformation($"EnqueuedTimeUtc={message.SystemProperties.EnqueuedTimeUtc}");
                 }
@@ -184,6 +195,85 @@ namespace RatingAPIFunc
                     log.LogInformation($"EnqueuedTimeUtc={message.SystemProperties.EnqueuedTimeUtc}");
                 }
             }
+        }
+
+        [FunctionName("ProcessHighValueReceipts")]
+        public static async Task ProcessHighValueReceipts(
+                    [ServiceBusTrigger("receipts", "receipts-high-value", Connection = "ServiceBusConnection")]
+                    ReceiptInfo receiptInfo,
+                    Int32 deliveryCount,
+                    DateTime enqueuedTimeUtc,
+                    string messageId,
+                    ExecutionContext context,
+                    [Blob("receipts-high-value", Connection = "ReceiptsStorageAccount")] CloudBlobContainer blobContainer,
+                    ILogger log)
+        {
+            string base64EncodedReceipt = await Base64EncodeReceipt(receiptInfo.receiptUrl, context);
+            HighValueReceipt highValueReceipt = new HighValueReceipt
+            {
+                Items = receiptInfo.totalItems,
+                ReceiptImage = base64EncodedReceipt,
+                SalesDate = receiptInfo.salesDate,
+                SalesNumber = receiptInfo.salesNumber,
+                Store = receiptInfo.storeLocation,
+                TotalCost = receiptInfo.totalCost
+            };
+
+            log.LogInformation($"Base64 Encoded Receipt={base64EncodedReceipt}");
+
+            string blobName = Guid.NewGuid().ToString("D");
+            CloudBlockBlob blob = blobContainer.GetBlockBlobReference($"{blobName}");
+            // use Upload* method according to your need
+            await blob.UploadTextAsync(JsonConvert.SerializeObject(highValueReceipt));
+        }
+
+        [FunctionName("ProcessGeneralReceipts")]
+        public static async Task ProcessGeneralReceipts(
+                    [ServiceBusTrigger("receipts", "receipts", Connection = "ServiceBusConnection")]
+                    ReceiptInfo receiptInfo,
+                    Int32 deliveryCount,
+                    DateTime enqueuedTimeUtc,
+                    string messageId,
+                    ExecutionContext context,
+                    [Blob("receipts", Connection = "ReceiptsStorageAccount")] CloudBlobContainer blobContainer,
+                    ILogger log)
+        {
+            GeneralReceipt generalReceipt = new GeneralReceipt
+            {
+                Items = receiptInfo.totalItems,
+                SalesDate = receiptInfo.salesDate,
+                SalesNumber = receiptInfo.salesNumber,
+                Store = receiptInfo.storeLocation,
+                TotalCost = receiptInfo.totalCost
+            };
+
+            string blobName = Guid.NewGuid().ToString("D");
+            CloudBlockBlob blob = blobContainer.GetBlockBlobReference($"{blobName}");
+            // use Upload* method according to your need
+            await blob.UploadTextAsync(JsonConvert.SerializeObject(generalReceipt));
+        }
+
+        private static async Task<Message> BuildQueueMessage(JObject posJson, ILogger log)
+        {
+            ReceiptInfo receiptInfo = new ReceiptInfo();
+            receiptInfo.receiptUrl = posJson["header"]["receiptUrl"].ToString();
+            receiptInfo.storeLocation = posJson["header"]["locationId"].ToString();
+            receiptInfo.salesDate = posJson["header"]["dateTime"].ToString();
+            receiptInfo.salesNumber = posJson["header"]["salesNumber"].ToString();
+            receiptInfo.totalCost = double.Parse(posJson["header"]["totalCost"].ToString());
+
+            JArray quantityArray = (JArray)posJson["details"];            
+            foreach (JObject qObj in quantityArray)
+            {
+                receiptInfo.totalItems = receiptInfo.totalItems + int.Parse(qObj["quantity"].ToString());
+            }
+
+            // Create Message ans set its properties
+            var message = new Message(Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(receiptInfo)));
+            message.UserProperties.Add("totalCost", receiptInfo.totalCost);
+
+            log.LogInformation($"C# function sent a message to topic: {JsonConvert.SerializeObject(receiptInfo)} ");
+            return message;
         }
 
         private static async Task<string> CobmineFiles(string prefix)
@@ -235,6 +325,15 @@ namespace RatingAPIFunc
 
             return false;
         }
+
+        private static async Task<string> Base64EncodeReceipt(string fileLocation, ExecutionContext context)
+        {
+            WebClient webClient = new WebClient();
+            string downloadedFilePath = Path.Combine(context.FunctionDirectory, Path.GetTempFileName());
+            webClient.DownloadFile(fileLocation, downloadedFilePath);
+            byte[] fileBytes = await File.ReadAllBytesAsync(downloadedFilePath);
+            return Convert.ToBase64String(fileBytes);
+        }
     }
 
     public class Rating
@@ -270,5 +369,33 @@ namespace RatingAPIFunc
         public string totaltax { get; set; }
     }
 
-    //public class 
+    public class ReceiptInfo
+    {
+        public int totalItems { get; set; }
+        public double totalCost { get; set; }
+        public string salesNumber { get; set; }
+        public string salesDate { get; set; }
+        public string storeLocation { get; set; }
+        public string receiptUrl { get; set; }
+    }
+
+    public class HighValueReceipt
+    {
+        public string Store { get; set; }
+        public string SalesNumber { get; set; }
+        public double TotalCost { get; set; }
+        public int Items { get; set; }
+        public string SalesDate { get; set; }
+        public string ReceiptImage { get; set; }
+    }
+
+
+    public class GeneralReceipt
+    {
+        public string Store { get; set; }
+        public string SalesNumber { get; set; }
+        public double TotalCost { get; set; }
+        public int Items { get; set; }
+        public string SalesDate { get; set; }
+    }
 }
