@@ -22,19 +22,33 @@ using Microsoft.Azure.WebJobs.ServiceBus;
 using Microsoft.Azure.ServiceBus;
 using System.Net;
 using Microsoft.Azure.Storage.Blob;
+using Microsoft.ApplicationInsights.Extensibility;
+using Microsoft.ApplicationInsights;
+using Azure.AI.TextAnalytics;
+using Azure;
+using Microsoft.Azure.Documents.SystemFunctions;
+using Microsoft.ApplicationInsights.DataContracts;
 
 namespace RatingAPIFunc
 {
-    public static class RatingAPIFuncApp
+    public class RatingAPIFuncApp
     {
+        private readonly TelemetryClient telemetryClient;
+
+        public RatingAPIFuncApp(TelemetryConfiguration telemetryConfiguration)
+        {
+            this.telemetryClient = new TelemetryClient(telemetryConfiguration);
+        }
+
         // Comments-1
         [FunctionName("CreateRating")]
-        public static async Task<IActionResult> CreateRating(
+        public async Task<IActionResult> CreateRating(
             [HttpTrigger(AuthorizationLevel.Function, "post", Route = null)] HttpRequest req,
             [CosmosDB(
             databaseName: "ratings",
             collectionName: "ratings",
             ConnectionStringSetting = "RatingsDBConnection")]IAsyncCollector<Rating> ratingsOut,
+            ExecutionContext context,
             ILogger log)
         {
             string requestBody = await new StreamReader(req.Body).ReadToEndAsync();
@@ -44,6 +58,12 @@ namespace RatingAPIFunc
             bool isProductValid = await IsProductIdValidAsync(rating.productId);
             if (isProductValid && isUserValid)
             {
+                rating.sentimentScore = await GetReviewSentimentScore(rating.userNotes, context);
+
+                // Set Metric
+                var metric = new MetricTelemetry("NZ Sentiment", rating.sentimentScore);
+                this.telemetryClient.TrackMetric(metric);
+
                 rating.id = Guid.NewGuid().ToString();
                 rating.timestamp = DateTime.Now.ToString("u");
                 await ratingsOut.AddAsync(rating);
@@ -54,7 +74,7 @@ namespace RatingAPIFunc
         }
 
         [FunctionName("GetRating")]
-        public static async Task<IActionResult> GetRating(
+        public async Task<IActionResult> GetRating(
             [HttpTrigger(AuthorizationLevel.Function, "get", Route = null)] HttpRequest req,
             [CosmosDB(
             databaseName: "ratings",
@@ -74,7 +94,7 @@ namespace RatingAPIFunc
         }
 
         [FunctionName("GetRatings")]
-        public static async Task<IActionResult> GetRatings(
+        public async Task<IActionResult> GetRatings(
             [HttpTrigger(AuthorizationLevel.Function, "get", Route = null)] HttpRequest req,
             [CosmosDB(
             databaseName: "ratings",
@@ -95,7 +115,7 @@ namespace RatingAPIFunc
         }
 
         [FunctionName("ProcessBtachFiles")]
-        public static async Task<IActionResult> ProcessBatchFiles(
+        public async Task<IActionResult> ProcessBatchFiles(
             [HttpTrigger(AuthorizationLevel.Function, "post", Route = null)] HttpRequest req,
             [CosmosDB(
             databaseName: "ratings",
@@ -156,7 +176,7 @@ namespace RatingAPIFunc
         }
         
         [FunctionName("ProcessPOSEvents")]
-        public static async Task ProcessPOSEvents(
+        public async Task ProcessPOSEvents(
             [EventHubTrigger("samples-workitems", Connection = "EventHubConnectionAppSetting")] EventData[] eventHubMessages,
             [CosmosDB(
             databaseName: "ratings",
@@ -198,7 +218,7 @@ namespace RatingAPIFunc
         }
 
         [FunctionName("ProcessHighValueReceipts")]
-        public static async Task ProcessHighValueReceipts(
+        public async Task ProcessHighValueReceipts(
                     [ServiceBusTrigger("receipts", "receipts-high-value", Connection = "ServiceBusConnection")]
                     ReceiptInfo receiptInfo,
                     Int32 deliveryCount,
@@ -228,7 +248,7 @@ namespace RatingAPIFunc
         }
 
         [FunctionName("ProcessGeneralReceipts")]
-        public static async Task ProcessGeneralReceipts(
+        public async Task ProcessGeneralReceipts(
                     [ServiceBusTrigger("receipts", "receipts", Connection = "ServiceBusConnection")]
                     ReceiptInfo receiptInfo,
                     Int32 deliveryCount,
@@ -253,7 +273,20 @@ namespace RatingAPIFunc
             await blob.UploadTextAsync(JsonConvert.SerializeObject(generalReceipt));
         }
 
-        private static async Task<Message> BuildQueueMessage(JObject posJson, ILogger log)
+        private async Task<double> GetReviewSentimentScore(string reviewText, ExecutionContext context)
+        {
+            var config = new ConfigurationBuilder()
+                .SetBasePath(context.FunctionAppDirectory)
+                .AddJsonFile("local.settings.json", optional: true, reloadOnChange: true)
+                .AddEnvironmentVariables()
+                .Build();
+            // Create a BlobServiceClient object which will be used to create a container client
+            var client = new TextAnalyticsClient(new Uri(config["AIEndpoint"]), new AzureKeyCredential(config["AICredentials"]));
+            DocumentSentiment documentSentiment = client.AnalyzeSentiment(reviewText);
+            return documentSentiment.ConfidenceScores.Positive;
+        }
+
+        private async Task<Message> BuildQueueMessage(JObject posJson, ILogger log)
         {
             ReceiptInfo receiptInfo = new ReceiptInfo();
             receiptInfo.receiptUrl = posJson["header"]["receiptUrl"].ToString();
@@ -276,7 +309,7 @@ namespace RatingAPIFunc
             return message;
         }
 
-        private static async Task<string> CobmineFiles(string prefix)
+        private async Task<string> CobmineFiles(string prefix)
         {
             string jsonData = @"{
                                   'orderHeaderDetailsCSVUrl': 'https://nzserverlessohbatchdata.blob.core.windows.net/datafiles/XXXXXXXXXXXXXX-OrderHeaderDetails.csv',
@@ -298,7 +331,7 @@ namespace RatingAPIFunc
             return responseData;
         }
 
-        private static async Task<bool> IsUserIdValidAsync(string userId)
+        private async Task<bool> IsUserIdValidAsync(string userId)
         {
             HttpClient newClient = new HttpClient();
             HttpRequestMessage newRequest = new HttpRequestMessage(HttpMethod.Get, string.Format("https://serverlessohuser.trafficmanager.net/api/GetUser?userId={0}", userId));
@@ -312,7 +345,7 @@ namespace RatingAPIFunc
             return false;
         }
 
-        private static async Task<bool> IsProductIdValidAsync(string productId)
+        private async Task<bool> IsProductIdValidAsync(string productId)
         {
             HttpClient newClient = new HttpClient();
             HttpRequestMessage newRequest = new HttpRequestMessage(HttpMethod.Get, string.Format("https://serverlessohproduct.trafficmanager.net/api/GetProduct?productId={0}", productId));
@@ -326,7 +359,7 @@ namespace RatingAPIFunc
             return false;
         }
 
-        private static async Task<string> Base64EncodeReceipt(string fileLocation, ExecutionContext context)
+        private async Task<string> Base64EncodeReceipt(string fileLocation, ExecutionContext context)
         {
             WebClient webClient = new WebClient();
             string downloadedFilePath = Path.Combine(context.FunctionDirectory, Path.GetTempFileName());
@@ -345,6 +378,7 @@ namespace RatingAPIFunc
         public string locationName { get; set; }
         public int rating { get; set; }
         public string userNotes { get; set; }
+        public double sentimentScore { get; set; }
     }
 
     public class OrderHeaderDetails
