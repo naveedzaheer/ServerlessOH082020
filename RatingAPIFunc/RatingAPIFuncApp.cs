@@ -33,12 +33,12 @@ namespace RatingAPIFunc
 {
     public class RatingAPIFuncApp
     {
-        private readonly TelemetryClient telemetryClient;
+        //private readonly TelemetryClient telemetryClient;
 
-        public RatingAPIFuncApp(TelemetryConfiguration telemetryConfiguration)
-        {
-            this.telemetryClient = new TelemetryClient(telemetryConfiguration);
-        }
+        //public RatingAPIFuncApp(TelemetryConfiguration telemetryConfiguration)
+        //{
+        //    this.telemetryClient = new TelemetryClient(telemetryConfiguration);
+        //}
 
         // Comments-1
         [FunctionName("CreateRating")]
@@ -48,6 +48,7 @@ namespace RatingAPIFunc
             databaseName: "ratings",
             collectionName: "ratings",
             ConnectionStringSetting = "RatingsDBConnection")]IAsyncCollector<Rating> ratingsOut,
+            [EventHub("sentimenthub", Connection = "SentimentEventHubConnectionAppSetting")] IAsyncCollector<EventData> outputEvents,
             ExecutionContext context,
             ILogger log)
         {
@@ -55,19 +56,31 @@ namespace RatingAPIFunc
             Rating rating = JsonConvert.DeserializeObject<Rating>(requestBody);
 
             bool isUserValid = await IsUserIdValidAsync(rating.userId);
-            bool isProductValid = await IsProductIdValidAsync(rating.productId);
-            if (isProductValid && isUserValid)
+            string productName = await GetProductNameAsync(rating.productId);
+            if (!String.IsNullOrEmpty(productName) && isUserValid)
             {
                 rating.sentimentScore = await GetReviewSentimentScore(rating.userNotes, context);
+                string ratingJSON = JsonConvert.SerializeObject(rating);
 
-                // Set Metric
-                var metric = new MetricTelemetry("NZ Sentiment", rating.sentimentScore);
-                this.telemetryClient.TrackMetric(metric);
+                // Set Metric // Need to comment when deploying to Azure
+                //var metric = new MetricTelemetry("NZ Sentiment", rating.sentimentScore);
+                //this.telemetryClient.TrackMetric(metric);
 
                 rating.id = Guid.NewGuid().ToString();
                 rating.timestamp = DateTime.Now.ToString("u");
                 await ratingsOut.AddAsync(rating);
-                return new OkObjectResult(JsonConvert.SerializeObject(rating));
+
+                // Send to Event Hub
+                RatingInfo ratingInfo = new RatingInfo
+                {
+                    IceCreamFlavor = productName,
+                    SentimentScore = rating.sentimentScore
+                };
+                var eventDataPaylod = Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(ratingInfo));
+                var eventData = new EventData(eventDataPaylod);
+                await outputEvents.AddAsync(eventData);
+
+                return new OkObjectResult(ratingJSON);
             }
 
             return new BadRequestResult();
@@ -114,6 +127,7 @@ namespace RatingAPIFunc
             return new NotFoundObjectResult("No ratings found for userId:" + userId);
         }
 
+        /*
         [FunctionName("ProcessBtachFiles")]
         public async Task<IActionResult> ProcessBatchFiles(
             [HttpTrigger(AuthorizationLevel.Function, "post", Route = null)] HttpRequest req,
@@ -177,7 +191,7 @@ namespace RatingAPIFunc
         
         [FunctionName("ProcessPOSEvents")]
         public async Task ProcessPOSEvents(
-            [EventHubTrigger("samples-workitems", Connection = "EventHubConnectionAppSetting")] EventData[] eventHubMessages,
+            [EventHubTrigger("nzserverlessohhub", Connection = "EventHubConnectionAppSetting")] EventData[] eventHubMessages,
             [CosmosDB(
             databaseName: "ratings",
             collectionName: "posEvents",
@@ -273,6 +287,8 @@ namespace RatingAPIFunc
             await blob.UploadTextAsync(JsonConvert.SerializeObject(generalReceipt));
         }
 
+        */
+
         private async Task<double> GetReviewSentimentScore(string reviewText, ExecutionContext context)
         {
             var config = new ConfigurationBuilder()
@@ -359,6 +375,21 @@ namespace RatingAPIFunc
             return false;
         }
 
+        private async Task<string> GetProductNameAsync(string productId)
+        {
+            HttpClient newClient = new HttpClient();
+            HttpRequestMessage newRequest = new HttpRequestMessage(HttpMethod.Get, string.Format("https://serverlessohproduct.trafficmanager.net/api/GetProduct?productId={0}", productId));
+            HttpResponseMessage response = await newClient.SendAsync(newRequest);
+            string responseData = await response.Content.ReadAsStringAsync();
+            if (responseData.IndexOf(productId) > -1)
+            {
+                JObject productObject = JObject.Parse(responseData);
+                return productObject["productName"].ToString();
+            }
+
+            return "";
+        }
+
         private async Task<string> Base64EncodeReceipt(string fileLocation, ExecutionContext context)
         {
             WebClient webClient = new WebClient();
@@ -379,6 +410,12 @@ namespace RatingAPIFunc
         public int rating { get; set; }
         public string userNotes { get; set; }
         public double sentimentScore { get; set; }
+    }
+
+    public class RatingInfo
+    {
+        public string IceCreamFlavor { get; set; }
+        public double SentimentScore { get; set; }
     }
 
     public class OrderHeaderDetails
